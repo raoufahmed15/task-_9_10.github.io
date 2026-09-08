@@ -432,16 +432,17 @@ def engineer_features_from_raw(input_df: pd.DataFrame) -> pd.DataFrame:
 def run_inference(
     input_df: pd.DataFrame,
     task_a_model: Any,
-    task_b_model: Any | None = None,
+    task_b_model: Any,
 ) -> dict[str, Any]:
     """
     The notebook derives the extra signal columns from the raw fields,
     then feeds the model. This app computes those fields before sending
-    the final model-ready input matrix to Task A.
+    the final model-ready input matrix to the classifiers.
 
-    The public contract is a binary failure-detection answer:
-        False -> no machine failure
-        True  -> failure detected
+    The public contract is:
+        1) Task A returns binary machine failure detection.
+        2) When Task A flags a failure, Task B emits one or more labels
+           from the AI4I label set: TWF, HDF, PWF, OSF, RNF.
     """
 
     logger.info("Running Task A failure detection")
@@ -472,12 +473,28 @@ def run_inference(
     result: dict[str, Any] = {
         "failure_detected": failure_detected,
         "task_a_prediction": task_a_prediction,
-        "failure_mode": None,
+        "failure_mode": [],
         "failure_mode_labels": [],
     }
 
     if failure_detected:
         logger.warning("Task A result: FAILURE DETECTED")
+
+        # Ask the failure-mode model to produce labels from the AI4I
+        # canonical set as list[str]. Do not emit None as a failure mode.
+        failure_modes = get_predicted_failure_modes_from_task_b(
+            task_b_model,
+            model_input,
+            threshold=0.5,
+        )
+
+        result["failure_mode"] = failure_modes
+        result["failure_mode_labels"] = failure_modes
+
+        logger.warning(
+            "Task B result: failure_mode=%s",
+            ", ".join(failure_modes) if failure_modes else "NONE",
+        )
     else:
         logger.info("Task A result: NO FAILURE")
 
@@ -619,13 +636,24 @@ def render_failure_result(result: dict[str, Any]) -> None:
         icon="🚨",
     )
 
+    failure_modes = result.get("failure_mode") or []
+    if isinstance(failure_modes, str):
+        failure_modes = [failure_modes]
+
+    if failure_modes:
+        label_text = ", ".join(failure_modes)
+    else:
+        label_text = "No failure type detected"
+
     st.markdown(
-        """
+        f"""
         ### Failure Detection Output
 
         The model returned:
 
         **True** — machine is considered failed / requires inspection.
+
+        **Failure Type(s):** `{label_text}`
         """
     )
 
@@ -700,7 +728,7 @@ def main() -> None:
             result = run_inference(
                 input_df=input_df,
                 task_a_model=task_a_model,
-                task_b_model=None,
+                task_b_model=task_b_model,
             )
 
         except Exception as exc:
@@ -729,7 +757,7 @@ def main() -> None:
             {
                 "failure_detected": result.get("failure_detected"),
                 "task_a_prediction": result.get("task_a_prediction"),
-                "failure_mode": None,
+                "failure_mode": result.get("failure_mode", []),
             }
         )
 
