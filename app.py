@@ -25,6 +25,8 @@ MODEL_DIR = Path(
 TASK_A_MODEL_PATH = MODEL_DIR / "xgb_failure_detection_model.pkl"
 TASK_B_MODEL_PATH = MODEL_DIR / "ovr_failure_mode_model.pkl"
 
+FAILURE_MODE_LABELS = ["TWF", "HDF", "PWF", "OSF", "RNF"]
+
 # Comma-separated environment variable:
 # FEATURE_NAMES="temperature,pressure,humidity,vibration,rotation_speed"
 FEATURE_NAMES_ENV = os.getenv("FEATURE_NAMES", "").strip()
@@ -251,7 +253,8 @@ def get_failure_mode_label(predicted_class: Any, model: Any) -> str:
     Priority:
         1. FAILURE_MODE_NAMES environment variable
         2. model.classes_ mapping
-        3. raw predicted class
+        3. known AI4I failure labels (TWF/HDF/PWF/OSF/RNF)
+        4. raw predicted class
     """
     failure_mode_mapping = parse_failure_mode_names()
 
@@ -265,7 +268,44 @@ def get_failure_mode_label(predicted_class: Any, model: Any) -> str:
             if class_value == predicted_class:
                 return str(class_value)
 
+    if str(predicted_class) in FAILURE_MODE_LABELS:
+        return str(predicted_class)
+
     return str(predicted_class)
+
+
+def get_predicted_failure_modes_from_task_b(
+    task_b_model: Any,
+    input_df: pd.DataFrame,
+    threshold: float = 0.5,
+) -> list[str]:
+    """
+    Convert OneVsRestClassifier.predict_proba output into the
+    canonical AI4I failure-mode labels used in the notebook:
+
+    TWF, HDF, PWF, OSF, RNF
+    """
+    try:
+        probabilities = task_b_model.predict_proba(input_df)
+    except AttributeError:
+        predictions = task_b_model.predict(input_df)
+        probabilities = np.asarray(predictions)
+
+    probabilities = np.asarray(probabilities)
+
+    if probabilities.ndim == 1:
+        probabilities = probabilities.reshape(1, -1)
+
+    # The probability matrix emitted by sklearn OneVsRestClassifier
+    # is ordered per label in the same order as the failure columns.
+    predicted_columns = [
+        idx for idx, probability in enumerate(probabilities[0])
+        if probability >= threshold
+    ]
+
+    labels = [FAILURE_MODE_LABELS[idx] for idx in predicted_columns]
+
+    return labels
 
 
 def validate_input_dataframe(
@@ -355,6 +395,10 @@ def run_inference(
           ├── Class 0 -> Normal
           |
           └── Class 1 -> Task B -> Failure Mode
+
+    The notebook labels Task B as a One-vs-Rest multi-label model,
+    so the compatible Streamlit result should expose all failure
+    labels predicted by the model rather than first-flattening one label.
     """
 
     logger.info("Running Task A failure detection")
@@ -372,7 +416,8 @@ def run_inference(
     result: dict[str, Any] = {
         "failure_detected": task_a_prediction == 1,
         "task_a_prediction": task_a_prediction,
-        "failure_mode": None,
+        "failure_mode": [],
+        "failure_mode_labels": [],
     }
 
     # --------------------------------------------------------
@@ -391,21 +436,23 @@ def run_inference(
             "Task A result: FAILURE DETECTED. Running Task B."
         )
 
-        task_b_prediction = normalize_prediction(
-            task_b_model.predict(input_df)
-        )
-
-        failure_mode_label = get_failure_mode_label(
-            task_b_prediction,
+        failure_modes = get_predicted_failure_modes_from_task_b(
             task_b_model,
+            input_df,
+            threshold=0.5,
         )
 
-        result["task_b_prediction"] = task_b_prediction
-        result["failure_mode"] = failure_mode_label
+        if not failure_modes:
+            failure_modes = []
+
+        # Keep a stable label list in the output payload.
+        result["task_b_prediction"] = failure_modes
+        result["failure_mode"] = failure_modes
+        result["failure_mode_labels"] = failure_modes
 
         logger.warning(
             "Task B result: failure_mode=%s",
-            failure_mode_label,
+            ", ".join(failure_modes) if failure_modes else "NONE",
         )
 
         return result
@@ -426,6 +473,26 @@ def render_header() -> None:
     st.caption(
         "Sequential ML inference for machine failure detection "
         "and failure-mode classification."
+    )
+
+    st.markdown(
+        """
+        ### Expected inputs and outputs
+
+        **Inputs required by the trained pipeline** are the same feature columns
+        used to train the notebook model: product type `Type` plus the sensor
+        and engineered features such as temperature, process temperature,
+        rotational speed, torque, tool wear, and the generated engineered
+        features (`temp_diff`, `temp_ratio`, `mechanical_power`,
+        `torque_speed_interaction`, `tool_wear_squared`, `power_per_wear`).
+
+        **Task A output** is a binary machine failure flag:
+        `0 = no failure`, `1 = failure detected`.
+
+        **Task B output** is a failure-mode label list from the AI4I
+        notebook labels `TWF`, `HDF`, `PWF`, `OSF`, `RNF` when Task A predicts
+        a failure.
+        """
     )
 
 
@@ -473,6 +540,11 @@ def render_input_form(
     st.info(
         f"Detected {len(feature_names)} input features. "
         "Enter the values used by the trained model."
+    )
+
+    st.caption(
+        "Input order is fixed by the trained model. "
+        "The UI will show the same ordered columns expected by the model."
     )
 
     values: dict[str, Any] = {}
@@ -535,7 +607,15 @@ def render_failure_result(result: dict[str, Any]) -> None:
         icon="🚨",
     )
 
-    failure_mode = result.get("failure_mode", "Unknown")
+    failure_modes = result.get("failure_mode") or []
+
+    if isinstance(failure_modes, str):
+        failure_modes = [failure_modes]
+
+    if failure_modes:
+        failure_mode_text = ", ".join(failure_modes)
+    else:
+        failure_mode_text = "No failure mode identified"
 
     st.markdown(
         f"""
@@ -543,7 +623,7 @@ def render_failure_result(result: dict[str, Any]) -> None:
 
         **Failure Detection:** Class 1
 
-        **Failure Mode:** `{failure_mode}`
+        **Failure Mode(s):** `{failure_mode_text}`
         """
     )
 
