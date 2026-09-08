@@ -27,6 +27,24 @@ TASK_B_MODEL_PATH = MODEL_DIR / "ovr_failure_mode_model.pkl"
 
 FAILURE_MODE_LABELS = ["TWF", "HDF", "PWF", "OSF", "RNF"]
 
+RAW_INPUT_FEATURES = [
+    "Type",
+    "Air temperature [K]",
+    "Process temperature [K]",
+    "Rotational speed [rpm]",
+    "Torque [Nm]",
+    "Tool wear [min]",
+]
+
+ENGINEERED_FEATURES = [
+    "temp_diff",
+    "temp_ratio",
+    "mechanical_power",
+    "torque_speed_interaction",
+    "tool_wear_squared",
+    "power_per_wear",
+]
+
 # Comma-separated environment variable:
 # FEATURE_NAMES="temperature,pressure,humidity,vibration,rotation_speed"
 FEATURE_NAMES_ENV = os.getenv("FEATURE_NAMES", "").strip()
@@ -382,86 +400,88 @@ def validate_input_dataframe(
     return True, ""
 
 
+def engineer_features_from_raw(input_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute the engineered columns exactly as they are described in the
+    notebook from the user-supplied raw inputs only.
+    """
+    engineered = input_df.copy()
+
+    engineered["temp_diff"] = (
+        engineered["Process temperature [K]"] - engineered["Air temperature [K]"]
+    )
+    engineered["temp_ratio"] = (
+        engineered["Process temperature [K]"] / engineered["Air temperature [K]"]
+    )
+    engineered["mechanical_power"] = (
+        engineered["Torque [Nm]"]
+        * engineered["Rotational speed [rpm]"]
+        * (2 * np.pi / 60)
+    )
+    engineered["torque_speed_interaction"] = (
+        engineered["Torque [Nm]"] * engineered["Rotational speed [rpm]"]
+    )
+    engineered["tool_wear_squared"] = engineered["Tool wear [min]"] ** 2
+    engineered["power_per_wear"] = (
+        engineered["mechanical_power"] / (engineered["Tool wear [min]"] + 1)
+    )
+
+    return engineered
+
+
 def run_inference(
     input_df: pd.DataFrame,
     task_a_model: Any,
-    task_b_model: Any,
+    task_b_model: Any | None = None,
 ) -> dict[str, Any]:
     """
-    Sequential inference:
+    The notebook derives the extra signal columns from the raw fields,
+    then feeds the model. This app computes those fields before sending
+    the final model-ready input matrix to Task A.
 
-        Task A
-          |
-          ├── Class 0 -> Normal
-          |
-          └── Class 1 -> Task B -> Failure Mode
-
-    The notebook labels Task B as a One-vs-Rest multi-label model,
-    so the compatible Streamlit result should expose all failure
-    labels predicted by the model rather than first-flattening one label.
+    The public contract is a binary failure-detection answer:
+        False -> no machine failure
+        True  -> failure detected
     """
 
     logger.info("Running Task A failure detection")
 
+    model_input = engineer_features_from_raw(input_df)
+
+    # Preserve the exact model feature order. The feature list comes from
+    # the fitted Task A model's stored feature_names_in_ array.
+    feature_names = get_model_feature_names(task_a_model)
+    if not feature_names:
+        feature_names = RAW_INPUT_FEATURES + ENGINEERED_FEATURES
+
+    # Ensure only the model's expected ordered columns exist.
+    model_input = model_input[RAW_INPUT_FEATURES + ENGINEERED_FEATURES]
+    model_input = model_input.reindex(columns=feature_names)
+
     task_a_prediction = normalize_prediction(
-        task_a_model.predict(input_df)
+        task_a_model.predict(model_input)
     )
 
-    # Convert numpy integer/float classes into Python scalars.
     try:
         task_a_prediction = int(task_a_prediction)
     except (TypeError, ValueError):
         pass
 
+    failure_detected = task_a_prediction == 1
+
     result: dict[str, Any] = {
-        "failure_detected": task_a_prediction == 1,
+        "failure_detected": failure_detected,
         "task_a_prediction": task_a_prediction,
-        "failure_mode": [],
+        "failure_mode": None,
         "failure_mode_labels": [],
     }
 
-    # --------------------------------------------------------
-    # Class 0 -> System Normal
-    # --------------------------------------------------------
-    if task_a_prediction == 0:
+    if failure_detected:
+        logger.warning("Task A result: FAILURE DETECTED")
+    else:
         logger.info("Task A result: NO FAILURE")
 
-        return result
-
-    # --------------------------------------------------------
-    # Class 1 -> Run Task B
-    # --------------------------------------------------------
-    if task_a_prediction == 1:
-        logger.warning(
-            "Task A result: FAILURE DETECTED. Running Task B."
-        )
-
-        failure_modes = get_predicted_failure_modes_from_task_b(
-            task_b_model,
-            input_df,
-            threshold=0.5,
-        )
-
-        if not failure_modes:
-            failure_modes = []
-
-        # Keep a stable label list in the output payload.
-        result["task_b_prediction"] = failure_modes
-        result["failure_mode"] = failure_modes
-        result["failure_mode_labels"] = failure_modes
-
-        logger.warning(
-            "Task B result: failure_mode=%s",
-            ", ".join(failure_modes) if failure_modes else "NONE",
-        )
-
-        return result
-
-    # Unexpected class
-    raise ValueError(
-        f"Unexpected Task A prediction: {task_a_prediction}. "
-        "Expected 0 or 1."
-    )
+    return result
 
 
 # ============================================================
@@ -500,18 +520,15 @@ def render_model_info(task_a_model: Any, task_b_model: Any) -> None:
     with st.sidebar:
         st.header("Model Information")
 
-        st.write("**Task A**")
-        st.write("Binary Failure Detection")
-
-        st.write("**Task B**")
-        st.write("Failure Mode Classification")
+        st.write("**Failure Detection**")
+        st.write("Binary Task A model")
 
         st.divider()
 
         st.write("**Task A Model**")
         st.code(type(task_a_model).__name__)
 
-        st.write("**Task B Model**")
+        st.write("**Failure Mode Model**")
         st.code(type(task_b_model).__name__)
 
 
@@ -538,13 +555,8 @@ def render_input_form(
         categorical_features = {}
 
     st.info(
-        f"Detected {len(feature_names)} input features. "
-        "Enter the values used by the trained model."
-    )
-
-    st.caption(
-        "Input order is fixed by the trained model. "
-        "The UI will show the same ordered columns expected by the model."
+        "Provide the raw machine inputs only. "
+        "The app will compute the engineered notebook features automatically."
     )
 
     values: dict[str, Any] = {}
@@ -553,7 +565,7 @@ def render_input_form(
 
         columns = st.columns(2)
 
-        for index, feature_name in enumerate(feature_names):
+        for index, feature_name in enumerate(RAW_INPUT_FEATURES):
             with columns[index % 2]:
                 if feature_name in categorical_features:
                     allowed = list(categorical_features[feature_name])
@@ -581,49 +593,39 @@ def render_input_form(
     if not submitted:
         return None
 
-    return pd.DataFrame([values], columns=feature_names)
+    return pd.DataFrame([values], columns=RAW_INPUT_FEATURES)
 
 
 def render_normal_result() -> None:
     st.success(
-        "✅ SYSTEM NORMAL",
+        "✅ No Failure Detected",
         icon="✅",
     )
 
     st.markdown(
         """
-        ### No Failure Detected
+        ### Failure Detection Output
 
-        The failure detection model classified the machine as:
+        The model returned:
 
-        **Class 0 — Normal**
+        **False** — machine is considered normal.
         """
     )
 
 
 def render_failure_result(result: dict[str, Any]) -> None:
     st.error(
-        "🚨 FAILURE DETECTED",
+        "🚨 Failure Detected",
         icon="🚨",
     )
 
-    failure_modes = result.get("failure_mode") or []
-
-    if isinstance(failure_modes, str):
-        failure_modes = [failure_modes]
-
-    if failure_modes:
-        failure_mode_text = ", ".join(failure_modes)
-    else:
-        failure_mode_text = "No failure mode identified"
-
     st.markdown(
-        f"""
-        ### Machine Failure Warning
+        """
+        ### Failure Detection Output
 
-        **Failure Detection:** Class 1
+        The model returned:
 
-        **Failure Mode(s):** `{failure_mode_text}`
+        **True** — machine is considered failed / requires inspection.
         """
     )
 
@@ -664,7 +666,7 @@ def main() -> None:
     categorical_features = get_categorical_features(task_a_model)
 
     input_df = render_input_form(
-        feature_names,
+        RAW_INPUT_FEATURES,
         categorical_features,
     )
 
@@ -677,7 +679,7 @@ def main() -> None:
 
     is_valid, validation_error = validate_input_dataframe(
         input_df,
-        feature_names,
+        RAW_INPUT_FEATURES,
         categorical_features,
     )
 
@@ -698,7 +700,7 @@ def main() -> None:
             result = run_inference(
                 input_df=input_df,
                 task_a_model=task_a_model,
-                task_b_model=task_b_model,
+                task_b_model=None,
             )
 
         except Exception as exc:
@@ -722,16 +724,12 @@ def main() -> None:
     else:
         render_normal_result()
 
-    # --------------------------------------------------------
-    # Debug information for development
-    # --------------------------------------------------------
-
     with st.expander("Prediction details"):
         st.json(
             {
+                "failure_detected": result.get("failure_detected"),
                 "task_a_prediction": result.get("task_a_prediction"),
-                "task_b_prediction": result.get("task_b_prediction"),
-                "failure_mode": result.get("failure_mode"),
+                "failure_mode": None,
             }
         )
 
