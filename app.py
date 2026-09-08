@@ -152,6 +152,43 @@ def get_model_feature_names(model: Any) -> list[str]:
     return []
 
 
+def get_categorical_features(model: Any) -> dict[str, list[Any]]:
+    """
+    Inspect a fitted sklearn Pipeline for a ColumnTransformer step and
+    discover which input columns are categorical (e.g. encoded with
+    OneHotEncoder/OrdinalEncoder), along with the categories the
+    encoder was fitted on.
+
+    Returns a mapping: {column_name: [category_1, category_2, ...]}
+    """
+    categorical_features: dict[str, list[Any]] = {}
+
+    named_steps = getattr(model, "named_steps", None)
+
+    if not named_steps:
+        return categorical_features
+
+    for _, step in named_steps.items():
+        transformers = getattr(step, "transformers_", None)
+
+        if not transformers:
+            continue
+
+        for _, transformer, columns in transformers:
+            categories = getattr(transformer, "categories_", None)
+
+            if categories is None:
+                continue
+
+            if isinstance(columns, str):
+                columns = [columns]
+
+            for column, column_categories in zip(columns, categories):
+                categorical_features[str(column)] = list(column_categories)
+
+    return categorical_features
+
+
 def validate_models_exist() -> None:
     """Fail early with a clear message if artifacts are missing."""
     missing = []
@@ -234,12 +271,18 @@ def get_failure_mode_label(predicted_class: Any, model: Any) -> str:
 def validate_input_dataframe(
     input_df: pd.DataFrame,
     expected_features: list[str],
+    categorical_features: dict[str, list[Any]] | None = None,
 ) -> tuple[bool, str]:
     """
-    Validate feature names, count and numeric values.
+    Validate feature names, order, categorical domain membership,
+    and numeric finiteness without forcing categorical labels through
+    a numeric-only finite check.
     """
     if input_df.empty:
         return False, "No input features were provided."
+
+    if categorical_features is None:
+        categorical_features = {}
 
     missing = [
         feature
@@ -265,8 +308,36 @@ def validate_input_dataframe(
     if input_df.isnull().any().any():
         return False, "Input contains missing/null values."
 
-    if not np.isfinite(input_df.to_numpy(dtype=float)).all():
-        return False, "Input contains NaN or infinite values."
+    # Verify categorical columns are one of the learned encoder labels.
+    for column, categories in categorical_features.items():
+        if column not in input_df.columns:
+            continue
+
+        allowed = set(str(category) for category in categories)
+        observed = input_df[column]
+
+        for value in observed:
+            if pd.isna(value):
+                return False, f"Input contains missing/null values in {column}."
+
+            if str(value) not in allowed:
+                return (
+                    False,
+                    f"Unsupported value '{value}' for categorical feature "
+                    f"{column}. Allowed categories: {', '.join(sorted(allowed))}.",
+                )
+
+    # Numeric columns are everything not listed in the categorical feature map.
+    numeric_columns = [
+        column
+        for column in expected_features
+        if column not in categorical_features
+    ]
+
+    if numeric_columns:
+        numeric_data = input_df[numeric_columns].to_numpy(dtype=float)
+        if not np.isfinite(numeric_data).all():
+            return False, "Input contains NaN or infinite values."
 
     return True, ""
 
@@ -377,7 +448,10 @@ def render_model_info(task_a_model: Any, task_b_model: Any) -> None:
         st.code(type(task_b_model).__name__)
 
 
-def render_input_form(feature_names: list[str]) -> pd.DataFrame | None:
+def render_input_form(
+    feature_names: list[str],
+    categorical_features: dict[str, list[Any]] | None = None,
+) -> pd.DataFrame | None:
     st.subheader("Machine Sensor Input")
 
     if not feature_names:
@@ -393,12 +467,15 @@ def render_input_form(feature_names: list[str]) -> pd.DataFrame | None:
 
         return None
 
+    if categorical_features is None:
+        categorical_features = {}
+
     st.info(
         f"Detected {len(feature_names)} input features. "
         "Enter the values used by the trained model."
     )
 
-    values: dict[str, float] = {}
+    values: dict[str, Any] = {}
 
     with st.form("prediction_form"):
 
@@ -406,13 +483,22 @@ def render_input_form(feature_names: list[str]) -> pd.DataFrame | None:
 
         for index, feature_name in enumerate(feature_names):
             with columns[index % 2]:
-                values[feature_name] = st.number_input(
-                    label=feature_name,
-                    value=0.0,
-                    step=0.01,
-                    format="%.6f",
-                    key=f"feature_{feature_name}",
-                )
+                if feature_name in categorical_features:
+                    allowed = list(categorical_features[feature_name])
+                    values[feature_name] = st.selectbox(
+                        label=feature_name,
+                        options=allowed,
+                        index=0,
+                        key=f"feature_{feature_name}",
+                    )
+                else:
+                    values[feature_name] = st.number_input(
+                        label=feature_name,
+                        value=0.0,
+                        step=0.01,
+                        format="%.6f",
+                        key=f"feature_{feature_name}",
+                    )
 
         submitted = st.form_submit_button(
             "🔍 Analyze Machine",
@@ -495,8 +581,12 @@ def main() -> None:
     render_model_info(task_a_model, task_b_model)
 
     feature_names = get_model_feature_names(task_a_model)
+    categorical_features = get_categorical_features(task_a_model)
 
-    input_df = render_input_form(feature_names)
+    input_df = render_input_form(
+        feature_names,
+        categorical_features,
+    )
 
     if input_df is None:
         return
@@ -508,6 +598,7 @@ def main() -> None:
     is_valid, validation_error = validate_input_dataframe(
         input_df,
         feature_names,
+        categorical_features,
     )
 
     if not is_valid:
